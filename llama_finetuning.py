@@ -21,7 +21,7 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     default_data_collator,
-    BitsAndBytesConfig
+    BitsAndBytesConfig,
 )
 import torch.distributed as dist
 
@@ -38,7 +38,7 @@ from utils.train_utils import (
     clear_gpu_cache,
     get_parameter_dtypes,
     print_model_size,
-    get_policies  
+    get_policies,
 )
 
 from utils.dataset_utils import get_preprocessed_dataset
@@ -85,23 +85,34 @@ def main(**kwargs):
     if torch.distributed.is_initialized():
         torch.cuda.set_device(rank)
         setup_environ_flags(rank)
-    
+
     # Calculate gradient accumulation steps
-    gradient_accumulation_steps = train_config.batch_size_training // train_config.micro_batch_size
-     
-    # Load the pre-trained model and setup its configuration
-    model = LlamaForCausalLM.from_pretrained(
-        train_config.model_name,
-        load_in_8bit=True if train_config.quantization else None,
-        device_map="auto" if train_config.quantization else None,
+    gradient_accumulation_steps = (
+        train_config.batch_size_training // train_config.micro_batch_size
     )
-    
+
+    # Load the pre-trained model and setup its configuration
+    # model = LlamaForCausalLM.from_pretrained(
+    #     train_config.model_name,
+    #     load_in_8bit=True if train_config.quantization else None,
+    #     device_map="auto" if train_config.quantization else None,
+    # )
+    from transformers import AutoConfig
+
+    model_config = AutoConfig.from_pretrained("meta-llama/Llama-2-7b-hf")
+    model_config.num_attention_heads = 2
+    model_config.num_hidden_layers = 2
+    model_config.num_key_value_heads = 2
+    model_config.hidden_size = 256
+
+    model = LlamaForCausalLM._from_config(model_config)
+
     print_model_size(model, train_config, rank if train_config.enable_fsdp else 0)
-    
+
     # Prepare the model for int8 training if quantization is enabled
     if train_config.quantization:
         model = prepare_model_for_int8_training(model)
-        
+
     # Convert the model to bfloat16 if fsdp and pure_bf16 is enabled
     if train_config.enable_fsdp and fsdp_config.pure_bf16:
         model.to(torch.bfloat16)
@@ -109,29 +120,31 @@ def main(**kwargs):
     # Load the tokenizer and add special tokens
     tokenizer = LlamaTokenizer.from_pretrained(train_config.model_name)
     tokenizer.add_special_tokens(
-            {
-            
-                "pad_token": "<PAD>",
-            }
-        )
+        {
+            "pad_token": "<PAD>",
+        }
+    )
     if train_config.use_peft:
         peft_config = generate_peft_config(train_config, kwargs)
         model = get_peft_model(model, peft_config)
         model.print_trainable_parameters()
-    
-    #setting up FSDP if enable_fsdp is enabled
+
+    # setting up FSDP if enable_fsdp is enabled
     if train_config.enable_fsdp:
         if not train_config.use_peft and train_config.freeze_layers:
-            
             freeze_transformer_layers(train_config.num_freeze_layers)
 
         mixed_precision_policy, wrapping_policy = get_policies(fsdp_config, rank)
         my_auto_wrapping_policy = fsdp_auto_wrap_policy(model, LlamaDecoderLayer)
-   
+
         model = FSDP(
             model,
-            auto_wrap_policy= my_auto_wrapping_policy if train_config.use_peft else wrapping_policy,
-            mixed_precision=mixed_precision_policy if not fsdp_config.pure_bf16 else None,
+            auto_wrap_policy=my_auto_wrapping_policy
+            if train_config.use_peft
+            else wrapping_policy,
+            mixed_precision=mixed_precision_policy
+            if not fsdp_config.pure_bf16
+            else None,
             sharding_strategy=fsdp_config.sharding_strategy,
             device_id=torch.cuda.current_device(),
             limit_all_gathers=True,
@@ -142,14 +155,14 @@ def main(**kwargs):
         model.to("cuda")
 
     dataset_config = generate_dataset_config(train_config, kwargs)
-    
-     # Load and preprocess the dataset for training and validation
+
+    # Load and preprocess the dataset for training and validation
     dataset_train = get_preprocessed_dataset(
         tokenizer,
         dataset_config,
         split="train",
     )
-    
+
     if not train_config.enable_fsdp or rank == 0:
         print(f"--> Training Set Length = {len(dataset_train)}")
 
@@ -159,7 +172,7 @@ def main(**kwargs):
         split="test",
     )
     if not train_config.enable_fsdp or rank == 0:
-            print(f"--> Validation Set Length = {len(dataset_val)}")
+        print(f"--> Validation Set Length = {len(dataset_val)}")
 
     train_sampler = None
     val_sampler = None
@@ -176,7 +189,7 @@ def main(**kwargs):
                 rank=dist.get_rank(),
                 num_replicas=dist.get_world_size(),
             )
-        
+
     # Create DataLoaders for the training and validation dataset
     train_dataloader = torch.utils.data.DataLoader(
         dataset_train,
@@ -198,9 +211,13 @@ def main(**kwargs):
             drop_last=True,
             collate_fn=default_data_collator,
         )
-        
+
     # Initialize the optimizer and learning rate scheduler
-    if fsdp_config.pure_bf16 and fsdp_config.optimizer == "anyprecision":
+    if (
+        fsdp_config.pure_bf16
+        and fsdp_config is not None
+        and fsdp_config.optimizer == "anyprecision"
+    ):
         optimizer = AnyPrecisionAdamW(
             model.parameters(),
             lr=train_config.lr,
@@ -217,10 +234,11 @@ def main(**kwargs):
     scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
 
     # Start the training process
+    print(local_rank)
     results = train(
         model,
         train_dataloader,
-        eval_dataloader, 
+        eval_dataloader,
         tokenizer,
         optimizer,
         scheduler,
@@ -230,8 +248,9 @@ def main(**kwargs):
         local_rank if train_config.enable_fsdp else None,
         rank if train_config.enable_fsdp else None,
     )
-    if not train_config.enable_fsdp or rank==0:
-        [print(f'Key: {k}, Value: {v}') for k, v in results.items()]
+    if not train_config.enable_fsdp or rank == 0:
+        [print(f"Key: {k}, Value: {v}") for k, v in results.items()]
+
 
 if __name__ == "__main__":
     fire.Fire(main)
