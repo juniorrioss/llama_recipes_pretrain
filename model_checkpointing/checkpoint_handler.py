@@ -120,13 +120,7 @@ def save_model_and_optimizer_sharded(model, rank, cfg, optim=None, verbose=True)
         print(f"Checkpoint Time = {t1-t0:.4f}\n")
 
 
-def save_model_checkpoint(
-    model,
-    optimizer,
-    rank,
-    cfg,
-    epoch=1,
-):
+def save_model_checkpoint(model, optimizer, rank, cfg, step):
     """saving model via rank0 cpu streaming and full_state_dict"""
 
     with FSDP.state_dict_type(
@@ -137,21 +131,18 @@ def save_model_checkpoint(
         print(f"saving process: rank {rank}  done w model state_dict\n")
 
     if rank == 0:
-        print(f"--> saving model ...")
         # create save path
 
         save_dir = Path.cwd() / cfg.checkpoint_folder
         save_dir.mkdir(parents=True, exist_ok=True)
         save_name = (
-            "checkpoint" + "-" + str(epoch) + ".pt"
+            "checkpoint" + "-" + str(step) + ".pt"
         )  # cfg.model_name + "-" + str(epoch) + ".pt"
         save_full_path = str(save_dir) + "/" + save_name
+        print(f"--> saving model ... at {save_full_path}\n")
 
         # save model
         torch.save(cpu_state, save_full_path)
-
-        if cfg.verbose:
-            print(f"model checkpoint saved for epoch {epoch} at {save_full_path}\n")
 
 
 def load_model_checkpoint(model, rank, cfg, verbose=True):
@@ -180,7 +171,7 @@ def load_model_checkpoint(model, rank, cfg, verbose=True):
         print(f"model checkpoint loaded to rank0 cpu")
 
 
-def save_optimizer_checkpoint(model, optimizer, rank, cfg, epoch=1):
+def save_optimizer_checkpoint(model, optimizer, rank, cfg, step):
     """save optimizer state via full state dict"""
 
     print(f"--> optim state call on rank {rank}\n")
@@ -196,12 +187,10 @@ def save_optimizer_checkpoint(model, optimizer, rank, cfg, epoch=1):
         save_dir = Path.cwd() / cfg.checkpoint_folder
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        opt_save_name = (
-            cfg.optimizer_name + "-" + cfg.model_name + "-" + str(epoch) + ".pt"
-        )
+        opt_save_name = "optimizer_state" + "-" + str(step) + ".pt"
         opt_save_full_path = save_dir / opt_save_name
 
-        print(f"--> saving optimizer state...")
+        print(f"--> saving optimizer state... {opt_save_full_path}")
 
         torch.save(optim_state, opt_save_full_path)
 

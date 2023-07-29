@@ -49,6 +49,26 @@ def byte2mb(x):
     return int(x / 2**20)
 
 
+def save_checkpoint(train_config, fsdp_config, model, optimizer, rank, step):
+    if fsdp_config.checkpoint_type == StateDictType.FULL_STATE_DICT:
+        model_checkpointing.save_model_checkpoint(
+            model, optimizer, rank, train_config, step
+        )
+    elif fsdp_config.checkpoint_type == StateDictType.SHARDED_STATE_DICT:
+        print(" we are about to save the models *******")
+
+        model_checkpointing.save_model_and_optimizer_sharded(model, rank, train_config)
+        if train_config.save_optimizer:
+            model_checkpointing.save_model_and_optimizer_sharded(
+                model, rank, train_config, optim=optimizer
+            )
+
+    if train_config.save_optimizer:
+        model_checkpointing.save_optimizer_checkpoint(
+            model, optimizer, rank, train_config, step
+        )
+
+
 def train(
     model,
     train_dataloader,
@@ -102,142 +122,90 @@ def train(
     val_loss = []
     results = {}
     best_val_loss = float("inf")
-    for epoch in range(train_config.num_epochs):
+    train_dataloader = iter(train_dataloader)
+    for step in tqdm(range(train_config.num_max_steps), colour="blue"):
         with MemoryTrace() as memtrace:  # track the memory usage
             model.train()
             total_loss = 0.0
             data_set_len = 0
 
-            for step, batch in enumerate(
-                tqdm(train_dataloader, colour="blue", desc=f"Training Epoch{epoch}")
-            ):
-                for key in batch.keys():
-                    if train_config.enable_fsdp:
-                        batch[key] = batch[key].to(local_rank)
-                    else:
-                        batch[key] = batch[key].to("cuda:0")
-                loss = model(**batch).loss
-                loss = loss / gradient_accumulation_steps
-                total_loss += loss.detach().float()
-                first_key = next(iter(batch))
-                data_set_len += len(batch[first_key])
-                if train_config.use_fp16:
-                    # if fp16 is enabled, use gradient scaler to handle gradient update
-                    scaler.scale(loss).backward()
-                    if (step + 1) % gradient_accumulation_steps == 0 or step == len(
-                        train_dataloader
-                    ) - 1:
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
-                else:
-                    # regular backpropagation when fp16 is not used
-                    loss.backward()
-                    if (step + 1) % gradient_accumulation_steps == 0 or step == len(
-                        train_dataloader
-                    ) - 1:
-                        optimizer.step()
-                        optimizer.zero_grad()
+            batch = next(train_dataloader)
 
-                if train_config.wandb:
-                    wandb.log(
-                        {"train_step_perplexity": torch.exp(loss), "train_loss": loss}
-                    )
-                print(
-                    f"\n step {step} is completed and loss is {loss.detach().float()}"
+            for key in batch.keys():
+                if train_config.enable_fsdp:
+                    batch[key] = batch[key].to(local_rank)
+                else:
+                    batch[key] = batch[key].to("cuda:0")
+            loss = model(**batch).loss
+            loss = loss / gradient_accumulation_steps
+            # total_loss += loss.detach().float()
+            # first_key = next(iter(batch))
+            # data_set_len += len(batch[first_key])
+            if train_config.use_fp16:
+                # if fp16 is enabled, use gradient scaler to handle gradient update
+                scaler.scale(loss).backward()
+                if (step + 1) % gradient_accumulation_steps == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    lr_scheduler.step()
+
+            else:
+                # regular backpropagation when fp16 is not used
+                loss.backward()
+                if (step + 1) % gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    # Update the learning rate as needed
+                    optimizer.zero_grad()
+                    lr_scheduler.step()
+
+            if train_config.wandb:
+                wandb.log(
+                    {"train_step_perplexity": torch.exp(loss), "train_loss": loss}
                 )
+            print(f"\n step {step} is completed and loss is {loss.detach().float()}")
+
+            if (
+                train_config.run_validation
+                and (step + 1) % train_config.eval_interval == 0
+            ):
+                eval_ppl, eval_epoch_loss = evaluation(
+                    model, train_config, eval_dataloader, rank, tokenizer
+                )
+
+            if (step + 1) % train_config.save_interval == 0:
+                save_checkpoint(train_config, fsdp_config, model, optimizer, rank, step)
+
         # Reducing total_loss across all devices if there's more than one CUDA device
         if torch.cuda.device_count() > 1 and train_config.enable_fsdp:
             dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-        train_epoch_loss = total_loss / data_set_len
-        train_perplexity = torch.exp(train_epoch_loss)
+        # train_epoch_loss = total_loss / data_set_len
+        # train_perplexity = torch.exp(train_epoch_loss)
 
-        train_prep.append(train_perplexity)
-        train_loss.append(train_epoch_loss)
-        if train_config.wandb:
-            wandb.log(
-                {
-                    "train_epoch_perplexity": train_perplexity,
-                    "train_epoch_loss": train_epoch_loss,
-                }
-            )
+        # train_prep.append(train_perplexity)
+        # train_loss.append(train_epoch_loss)
 
-        print(f"Max CUDA memory allocated was {memtrace.peak} GB")
-        print(f"Max CUDA memory reserved was {memtrace.max_reserved} GB")
-        print(f"Cuda Malloc retires : {memtrace.cuda_malloc_retires}")
-        print(
-            f"CPU Total Peak Memory consumed during the train (max): {memtrace.cpu_peaked + memtrace.cpu_begin} GB"
-        )
+        # print(f"Max CUDA memory allocated was {memtrace.peak} GB")
+        # print(f"Max CUDA memory reserved was {memtrace.max_reserved} GB")
+        # print(f"Cuda Malloc retires : {memtrace.cuda_malloc_retires}")
+        # print(
+        #     f"CPU Total Peak Memory consumed during the train (max): {memtrace.cpu_peaked + memtrace.cpu_begin} GB"
+        # )
 
-        # Update the learning rate as needed
-        lr_scheduler.step()
+    # avg_train_prep = sum(train_prep) / len(train_prep)
+    # avg_train_loss = sum(train_loss) / len(train_loss)
+    # if train_config.run_validation:
+    #     avg_eval_prep = sum(val_prep) / len(val_prep)
+    #     avg_eval_loss = sum(val_loss) / len(val_loss)
 
-        if train_config.run_validation:
-            eval_ppl, eval_epoch_loss = evaluation(
-                model, train_config, eval_dataloader, rank, tokenizer
-            )
-            if train_config.save_model and eval_epoch_loss < best_val_loss:
-                if train_config.use_peft:
-                    print(f"we are in the saving the PEFT modules")
-                    model.save_pretrained(train_config.output_dir)
-                    print(
-                        f"PEFT modules are saved in {train_config.output_dir} directory"
-                    )
+    # results["avg_train_prep"] = avg_train_prep
+    # results["avg_train_loss"] = avg_train_loss
+    # if train_config.run_validation:
+    #     results["avg_eval_prep"] = avg_eval_prep
+    #     results["avg_eval_loss"] = avg_eval_loss
 
-                else:
-                    if (
-                        not train_config.use_peft
-                        and fsdp_config.checkpoint_type == StateDictType.FULL_STATE_DICT
-                    ):
-                        model_checkpointing.save_model_checkpoint(
-                            model, optimizer, rank, train_config, epoch=1
-                        )
-                    elif (
-                        not train_config.use_peft
-                        and fsdp_config.checkpoint_type
-                        == StateDictType.SHARDED_STATE_DICT
-                    ):
-                        print(" we are about to save the models *******")
-
-                        model_checkpointing.save_model_and_optimizer_sharded(
-                            model, rank, train_config
-                        )
-                        if train_config.save_optimizer:
-                            model_checkpointing.save_model_and_optimizer_sharded(
-                                model, rank, train_config, optim=optimizer
-                            )
-
-                    if not train_config.use_peft and train_config.save_optimizer:
-                        model_checkpointing.save_optimizer_checkpoint(
-                            model, optimizer, rank, train_config, epoch=1
-                        )
-
-            if local_rank == 0 and eval_epoch_loss < best_val_loss:
-                best_val_loss = eval_epoch_loss
-                print(f"best eval loss on epoch {epoch} is {best_val_loss}")
-            val_loss.append(best_val_loss)
-            val_prep.append(eval_ppl)
-            if train_config.wandb:
-                wandb.log({"eval_perplexity": eval_ppl})
-
-        print(
-            f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}"
-        )
-        lr_scheduler.step()
-
-    avg_train_prep = sum(train_prep) / len(train_prep)
-    avg_train_loss = sum(train_loss) / len(train_loss)
-    if train_config.run_validation:
-        avg_eval_prep = sum(val_prep) / len(val_prep)
-        avg_eval_loss = sum(val_loss) / len(val_loss)
-
-    results["avg_train_prep"] = avg_train_prep
-    results["avg_train_loss"] = avg_train_loss
-    if train_config.run_validation:
-        results["avg_eval_prep"] = avg_eval_prep
-        results["avg_eval_loss"] = avg_eval_loss
-
-    return results
+    # return results
+    return
 
 
 def evaluation(model, train_config, eval_dataloader, local_rank, tokenizer):
@@ -292,6 +260,9 @@ def evaluation(model, train_config, eval_dataloader, local_rank, tokenizer):
 
     # Print evaluation metrics
     print(f" {eval_ppl=} {eval_epoch_loss=}")
+    if train_config.wandb:
+        wandb.log({"eval_perplexity": eval_ppl, "eval_loss": eval_epoch_loss})
+
     return eval_ppl, eval_epoch_loss
 
 
