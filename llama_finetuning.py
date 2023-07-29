@@ -4,6 +4,7 @@
 import os
 import sys
 from typing import List, Union
+from dataclasses import asdict
 
 import fire
 import torch
@@ -100,10 +101,10 @@ def main(**kwargs):
     from transformers import AutoConfig
 
     model_config = AutoConfig.from_pretrained("meta-llama/Llama-2-7b-hf")
-    model_config.num_attention_heads = 2
-    model_config.num_hidden_layers = 2
-    model_config.num_key_value_heads = 2
-    model_config.hidden_size = 256
+    model_config.num_attention_heads = 1
+    model_config.num_hidden_layers = 1
+    model_config.num_key_value_heads = 1
+    model_config.hidden_size = 32
 
     model = LlamaForCausalLM._from_config(model_config)
 
@@ -157,20 +158,26 @@ def main(**kwargs):
     dataset_config = generate_dataset_config(train_config, kwargs)
 
     # Load and preprocess the dataset for training and validation
-    dataset_train = get_preprocessed_dataset(
-        tokenizer,
-        dataset_config,
-        split="train",
-    )
+    # dataset_train = get_preprocessed_dataset(
+    #     tokenizer,
+    #     dataset_config,
+    #     split="train",
+    # )
 
+    from datasets import load_from_disk
+
+    dataset = load_from_disk(train_config.path_dataset)
+    dataset = dataset.train_test_split(test_size=0.05)
+    dataset_train = dataset["train"]
+    dataset_val = dataset["test"]
     if not train_config.enable_fsdp or rank == 0:
         print(f"--> Training Set Length = {len(dataset_train)}")
 
-    dataset_val = get_preprocessed_dataset(
-        tokenizer,
-        dataset_config,
-        split="test",
-    )
+    # dataset_val = get_preprocessed_dataset(
+    #     tokenizer,
+    #     dataset_config,
+    #     split="test",
+    # )
     if not train_config.enable_fsdp or rank == 0:
         print(f"--> Validation Set Length = {len(dataset_val)}")
 
@@ -233,9 +240,7 @@ def main(**kwargs):
         )
     scheduler = StepLR(optimizer, step_size=1, gamma=train_config.gamma)
 
-    # Start the training process
-    print(local_rank)
-    results = train(
+    train(
         model,
         train_dataloader,
         eval_dataloader,
@@ -248,8 +253,6 @@ def main(**kwargs):
         local_rank if train_config.enable_fsdp else None,
         rank if train_config.enable_fsdp else None,
     )
-    if not train_config.enable_fsdp or rank == 0:
-        [print(f"Key: {k}, Value: {v}") for k, v in results.items()]
 
 
 if __name__ == "__main__":
